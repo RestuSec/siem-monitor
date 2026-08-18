@@ -163,6 +163,10 @@ def check_headers(domain):
         log_event(domain, "headers", "SKIP", "Site unreachable", 0)
         return 0
 
+    if status >= 500:
+        log_event(domain, "headers", "SKIP", f"HTTP {status}, Cloudflare error page — no app headers", 0)
+        return 0
+
     h = {k.lower(): v for k, v in headers.items()}
     missing = []
     present = []
@@ -197,7 +201,6 @@ def check_paths(domain):
     """Probe common sensitive paths."""
     score = 0
     paths = [
-        ("/robots.txt", "robots.txt (info disclosure)"),
         ("/.env", ".env file exposed"),
         ("/.git/config", ".git directory exposed"),
         ("/wp-admin/", "WordPress admin exposed"),
@@ -208,10 +211,8 @@ def check_paths(domain):
         ("/.htaccess", ".htaccess file exposed"),
         ("/backup/", "Backup directory exposed"),
         ("/debug/", "Debug endpoint"),
-        ("/api/", "API endpoint"),
         ("/swagger/", "Swagger docs exposed"),
         ("/actuator", "Spring Actuator exposed"),
-        ("/.well-known/security.txt", "security.txt"),
     ]
 
     exposed = []
@@ -254,11 +255,11 @@ def check_uptime(domain):
         score += 20
         alert(domain, "SLOW_RESPONSE", "MEDIUM", f"Response time {ms}ms", 20)
 
-    # Check if server info leaked in headers
+    # Check if server info leaked in headers (skip Cloudflare — it's expected)
     server = headers.get("Server", "")
     x_powered = headers.get("X-Powered-By", "")
     leaks = []
-    if server:
+    if server and "cloudflare" not in server.lower():
         leaks.append(f"Server: {server}")
     if x_powered:
         leaks.append(f"X-Powered-By: {x_powered}")
