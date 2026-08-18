@@ -93,18 +93,13 @@ def run_rules(domain):
     now = datetime.now()
     alerts = []
 
-    # Down: 3 consecutive failures
-    rows = db_query(
-        "SELECT COUNT(*) as cnt FROM (SELECT status FROM events WHERE domain=? AND ts>=? ORDER BY id DESC LIMIT 3)",
+    # Down: 3 consecutive failures (status 0 = timeout, 502/503/504 = server/proxy error)
+    last3 = db_query(
+        "SELECT status FROM events WHERE domain=? AND ts>=? ORDER BY id DESC LIMIT 3",
         (domain, (now - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S"))
     )
-    if rows and rows[0]["cnt"] >= 3:
-        last3 = db_query(
-            "SELECT status FROM events WHERE domain=? AND ts>=? ORDER BY id DESC LIMIT 3",
-            (domain, (now - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S"))
-        )
-        if all(r["status"] == 0 for r in last3):
-            alerts.append(("SITE_DOWN", "CRITICAL", f"{domain} down — 3 gagal berturut-turut"))
+    if len(last3) >= 3 and all(r["status"] in (0, 502, 503, 504) for r in last3):
+        alerts.append(("SITE_DOWN", "CRITICAL", f"{domain} down — 3 gagal berturut-turut (status: {', '.join(str(r['status']) for r in last3)})"))
 
     # Slow: avg latency > 3000ms in last 5 checks
     row = db_query(
