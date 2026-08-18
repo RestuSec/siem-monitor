@@ -24,6 +24,7 @@ DB_PATH = Path(__file__).parent / "siem.db"
 DASHBOARD_PORT = 5000
 
 CONFIG = {"domain": None, "interval": 30}
+SCAN_HISTORY = []  # in-memory: [{"ts": ..., "score": ..., "ssl": ..., "headers": ..., "paths": ..., "uptime": ...}]
 
 # ── DB ───────────────────────────────────────────────────────────────────
 def init_db():
@@ -271,11 +272,15 @@ def check_uptime(domain):
 
 # ── Full scan ────────────────────────────────────────────────────────────
 def run_scan(domain):
-    total = 0
-    total += check_uptime(domain)
-    total += check_ssl(domain)
-    total += check_headers(domain)
-    total += check_paths(domain)
+    scores = {}
+    scores["uptime"] = check_uptime(domain)
+    scores["ssl"] = check_ssl(domain)
+    scores["headers"] = check_headers(domain)
+    scores["paths"] = check_paths(domain)
+    total = sum(scores.values())
+    SCAN_HISTORY.append({"ts": datetime.now().strftime("%H:%M:%S"), "score": min(100, total), **scores})
+    if len(SCAN_HISTORY) > 30:
+        SCAN_HISTORY.pop(0)
     return min(100, total)
 
 def threat_level():
@@ -315,67 +320,112 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>SIEM Monitor</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:monospace;background:#0a0a1a;color:#e0e0e0}
-.hdr{background:#111;padding:12px;text-align:center;border-bottom:2px solid #333}
-.hdr h1{color:#00ff88;font-size:18px}
-.ct{max-width:950px;margin:0 auto;padding:15px}
-.g{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:12px}
-.c{background:#111;border:1px solid #333;border-radius:8px;padding:12px}
-.c h2{color:#00ff88;font-size:12px;margin-bottom:8px;border-bottom:1px solid #222;padding-bottom:6px}
-.s{font-size:24px;font-weight:bold;color:#00ff88}
-.sl{font-size:10px;color:#888;margin-top:2px}
-.ring{text-align:center;padding:10px}
-.r{width:110px;height:110px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center}
-.ri{width:88px;height:88px;border-radius:50%;background:#111;display:flex;align-items:center;justify-content:center;flex-direction:column}
-.rv{font-size:26px;font-weight:bold}
-.rl{font-size:9px;color:#888;margin-top:2px}
-.n{border:4px solid #00ff88}.n .rv{color:#00ff88}
-.e{border:4px solid #00aaff}.e .rv{color:#00aaff}
-.w{border:4px solid #ffaa00}.w .rv{color:#ffaa00}
-.cr{border:4px solid #ff3333}.cr .rv{color:#ff3333}
+body{font-family:'Courier New',monospace;background:#0a0a1a;color:#e0e0e0;min-height:100vh}
+.hdr{background:linear-gradient(135deg,#0d1117,#161b22);padding:14px 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #30363d}
+.hdr h1{color:#00ff88;font-size:16px;letter-spacing:2px}
+.hdr .status{font-size:11px;color:#8b949e}
+.ct{max-width:1200px;margin:0 auto;padding:16px}
+.row{display:grid;gap:12px;margin-bottom:12px}
+.r3{grid-template-columns:280px 1fr 1fr}
+.r2{grid-template-columns:1fr 1fr}
+.r4{grid-template-columns:1fr 1fr 1fr 1fr}
+.c{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:14px;overflow:hidden}
+.c h2{color:#58a6ff;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #21262d}
+.c h3{color:#8b949e;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
+.s{font-size:28px;font-weight:bold;color:#00ff88;line-height:1}
+.sl{font-size:10px;color:#8b949e;margin-top:3px}
 .fw{grid-column:1/-1}
-table{width:100%;border-collapse:collapse;font-size:11px}
-th,td{padding:5px 8px;text-align:left;border-bottom:1px solid #1a1a1a}
-th{color:#00ff88;font-weight:normal}
-tr:hover{background:#1a1a2e}
-.ok{color:#00ff88}.err{color:#ff3333}.warn{color:#ffaa00}.info{color:#555}
-.sev-CRITICAL{color:#ff3333;font-weight:bold}.sev-HIGH{color:#ff8800}.sev-MEDIUM{color:#ffaa00}.sev-LOW{color:#888}
+
+/* Threat ring */
+.ring{text-align:center;padding:15px 0}
+.r{width:130px;height:130px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;position:relative}
+.r::before{content:'';position:absolute;inset:-6px;border-radius:50%;border:2px solid #21262d}
+.ri{width:104px;height:104px;border-radius:50%;background:#0d1117;display:flex;align-items:center;justify-content:center;flex-direction:column}
+.rv{font-size:32px;font-weight:bold}
+.rl{font-size:10px;color:#8b949e;margin-top:2px}
+.n{border:4px solid #00ff88;box-shadow:0 0 20px #00ff8833}.n .rv{color:#00ff88}
+.e{border:4px solid #58a6ff;box-shadow:0 0 20px #58a6ff33}.e .rv{color:#58a6ff}
+.w{border:4px solid #d29922;box-shadow:0 0 20px #d2992233}.w .rv{color:#d29922}
+.cr{border:4px solid #f85149;box-shadow:0 0 20px #f8514933}.cr .rv{color:#f85149}
+
+/* Category bars */
+.cat-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.cat-label{width:70px;font-size:10px;color:#8b949e;text-transform:uppercase}
+.cat-bar{flex:1;height:20px;background:#161b22;border-radius:4px;overflow:hidden;position:relative}
+.cat-fill{height:100%;border-radius:4px;transition:width 0.6s ease}
+.cat-val{font-size:11px;font-weight:bold;width:32px;text-align:right}
+
+/* Response time chart */
+.chart{display:flex;align-items:flex-end;gap:3px;height:80px;padding-top:8px}
+.chart-bar{flex:1;min-width:0;background:linear-gradient(to top,#00ff8844,#00ff88);border-radius:2px 2px 0 0;transition:height 0.3s;position:relative}
+.chart-bar:hover{opacity:0.8}
+.chart-bar .tip{display:none;position:absolute;bottom:calc(100% + 4px);left:50%;transform:translateX(-50%);background:#1c2128;border:1px solid #30363d;padding:2px 6px;border-radius:4px;font-size:9px;white-space:nowrap;z-index:1}
+.chart-bar:hover .tip{display:block}
+.chart-labels{display:flex;justify-content:space-between;font-size:8px;color:#484f58;margin-top:4px}
+
+/* Input */
 .input-row{display:flex;gap:8px;margin-bottom:10px}
-.input-row input{flex:1;background:#111;border:1px solid #333;color:#e0e0e0;padding:8px 12px;border-radius:6px;font-family:monospace;font-size:13px}
-.input-row input:focus{outline:none;border-color:#00ff88}
-.input-row button{background:#00ff88;color:#0a0a1a;border:none;padding:8px 16px;border-radius:6px;font-family:monospace;font-weight:bold;cursor:pointer;font-size:13px}
-.input-row button:hover{background:#00cc6a}
-.btn-disconnect{background:#ff3333 !important;color:#fff !important}
-.conn-info{font-size:11px;color:#888;margin-bottom:10px;padding:8px;background:#111;border:1px solid #222;border-radius:6px}
-.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
-.dot-on{background:#00ff88}.dot-off{background:#555}
-.score-bar{height:14px;background:#222;border-radius:4px;margin-top:6px;overflow:hidden}
-.score-fill{height:100%;border-radius:4px;transition:width 0.5s}
-.findings{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
-.tag{padding:3px 8px;border-radius:4px;font-size:10px;font-weight:bold}
-.tag-ok{background:#0a2a1a;color:#00ff88;border:1px solid #00ff8844}
-.tag-warn{background:#2a1a0a;color:#ffaa00;border:1px solid #ffaa0044}
-.tag-crit{background:#2a0a0a;color:#ff3333;border:1px solid #ff333344}
+.input-row input{flex:1;background:#0d1117;border:1px solid #30363d;color:#e0e0e0;padding:10px 14px;border-radius:6px;font-family:monospace;font-size:13px}
+.input-row input:focus{outline:none;border-color:#58a6ff}
+.input-row button{background:#238636;color:#fff;border:none;padding:10px 20px;border-radius:6px;font-family:monospace;font-weight:bold;cursor:pointer;font-size:12px;text-transform:uppercase;letter-spacing:1px}
+.input-row button:hover{background:#2ea043}
+.btn-disconnect{background:#da3633 !important}.btn-disconnect:hover{background:#f85149 !important}
+.conn-info{font-size:11px;color:#8b949e;margin-bottom:10px;padding:8px 12px;background:#0d1117;border:1px solid #21262d;border-radius:6px;display:flex;align-items:center;gap:8px}
+.status-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot-on{background:#00ff88;box-shadow:0 0 6px #00ff88}.dot-off{background:#484f58}
+
+/* Tables */
+table{width:100%;border-collapse:collapse;font-size:11px}
+th,td{padding:6px 10px;text-align:left;border-bottom:1px solid #161b22}
+th{color:#58a6ff;font-weight:normal;font-size:10px;text-transform:uppercase;letter-spacing:0.5px}
+tr:hover{background:#161b22}
+.ok{color:#3fb950}.err{color:#f85149}.warn{color:#d29922}
+.sev-CRITICAL{color:#f85149;font-weight:bold}.sev-HIGH{color:#d29922}.sev-MEDIUM{color:#d29922}.sev-LOW{color:#8b949e}
+
+/* Tags */
+.tag{display:inline-block;padding:3px 8px;border-radius:4px;font-size:9px;font-weight:bold;margin:2px}
+.tag-ok{background:#0d2818;color:#3fb950;border:1px solid #238636}
+.tag-warn{background:#2d1d00;color:#d29922;border:1px solid #d2992266}
+.tag-crit{background:#3d1114;color:#f85149;border:1px solid #f8514966}
+.tag-info{background:#0c2d6b;color:#58a6ff;border:1px solid #58a6ff44}
+
+/* Info grid */
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.info-item{padding:6px 8px;background:#161b22;border-radius:4px}
+.info-item .ik{font-size:9px;color:#484f58;text-transform:uppercase}
+.info-item .iv{font-size:12px;color:#e0e0e0;margin-top:2px}
+
+/* Scan history mini chart */
+.hist{display:flex;align-items:flex-end;gap:2px;height:40px}
+.hist-bar{flex:1;min-width:2px;border-radius:1px 1px 0 0;transition:height 0.3s}
 </style></head><body>
-<div class="hdr"><h1>SIEM MONITOR</h1></div>
+<div class="hdr">
+  <h1>SIEM MONITOR</h1>
+  <div class="status" id="hdrStatus">v2.0</div>
+</div>
 <div class="ct">
 <div class="input-row">
   <input type="text" id="domain" placeholder="Masukin domain... (contoh: restusec.my.id)">
   <button onclick="connect()" id="btnConnect">SCAN</button>
 </div>
-<div class="conn-info" id="connInfo"><span class="status-dot dot-off"></span>Belum connect. Masukin domain di atas.</div>
+<div class="conn-info" id="connInfo"><span class="status-dot dot-off"></span>Belum connect.</div>
 
-<div class="g">
-<div class="c"><h2>Threat Level</h2><div class="ring"><div class="r n" id="ring"><div class="ri"><div class="rv" id="rv">0</div><div class="rl" id="rl">AMAN</div></div></div></div></div>
-<div class="c"><h2>Score Breakdown</h2><div class="findings" id="findings"></div><div class="score-bar"><div class="score-fill" id="scoreFill" style="width:0;background:#00ff88"></div></div><div class="sl" id="scoreText" style="margin-top:4px">—</div></div>
-<div class="c"><h2>Info</h2><div style="font-size:11px;line-height:1.6" id="infoBox">—</div></div>
+<div class="row r3">
+  <div class="c"><h2>Threat Level</h2><div class="ring"><div class="r n" id="ring"><div class="ri"><div class="rv" id="rv">0</div><div class="rl" id="rl">AMAN</div></div></div></div>
+  <div style="margin-top:8px"><h3>Scan History</h3><div class="hist" id="histChart"></div></div></div>
+  <div class="c"><h2>Security Score</h2><div id="catBars"></div></div>
+  <div class="c"><h2>Domain Info</h2><div class="info-grid" id="infoGrid"><div class="info-item"><div class="ik">Status</div><div class="iv">—</div></div></div></div>
 </div>
 
-<div class="c fw" style="margin-bottom:12px"><h2>Security Findings</h2>
-<table><thead><tr><th>Check</th><th>Result</th><th>Score</th><th>Detail</th></tr></thead><tbody id="tev"></tbody></table></div>
+<div class="row r2">
+  <div class="c"><h2>Response Time</h2><div class="chart" id="rtChart"></div><div class="chart-labels"><span>15 scans ago</span><span>now</span></div></div>
+  <div class="c"><h2>Findings</h2><div id="findingsBox" style="display:flex;flex-wrap:wrap;gap:4px;max-height:120px;overflow-y:auto"></div></div>
+</div>
 
-<div class="c fw"><h2>Alerts</h2>
-<table><thead><tr><th>Time</th><th>Rule</th><th>Severity</th><th>Message</th></tr></thead><tbody id="tal"></tbody></table></div>
+<div class="row r2">
+  <div class="c"><h2>Alerts</h2><div style="max-height:220px;overflow-y:auto"><table><thead><tr><th>Time</th><th>Severity</th><th>Rule</th><th>Message</th></tr></thead><tbody id="tal"></tbody></table></div></div>
+  <div class="c"><h2>Scan Events</h2><div style="max-height:220px;overflow-y:auto"><table><thead><tr><th>Check</th><th>Result</th><th>Score</th><th>Detail</th></tr></thead><tbody id="tev"></tbody></table></div></div>
+</div>
 </div>
 
 <script>
@@ -385,45 +435,100 @@ function connect(){
   document.getElementById("btnConnect").textContent="SCANNING...";
   document.getElementById("btnConnect").disabled=true;
   fetch("/api/connect",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({domain:d})}).then(r=>r.json()).then(()=>{
-    setTimeout(()=>{document.getElementById("btnConnect").textContent="SCAN";document.getElementById("btnConnect").disabled=false;},2000);
+    setTimeout(()=>{document.getElementById("btnConnect").textContent="SCAN";document.getElementById("btnConnect").disabled=false;},3000);
   });
 }
 function disconnect(){
   fetch("/api/disconnect",{method:"POST"}).then(()=>u());
 }
+function barColor(v){return v>=70?"#f85149":v>=40?"#d29922":v>=20?"#58a6ff":"#3fb950"}
 function u(){fetch("/api").then(r=>r.json()).then(d=>{
+  // Connection info
   const ci=document.getElementById("connInfo");
   if(d.domain){
-    ci.innerHTML="<span class='status-dot dot-on'></span>Monitoring: <b>"+d.domain+"</b> (setiap "+d.interval+" detik) <span style='float:right;cursor:pointer;color:#ff5555' onclick='disconnect()'>[disconnect]</span>";
+    ci.innerHTML="<span class='status-dot dot-on'></span>Monitoring: <b style='color:#e0e0e0'>"+d.domain+"</b> &mdash; every "+d.interval+"s &nbsp;<span style='float:right;cursor:pointer;color:#f85149;font-size:10px' onclick='disconnect()'>[disconnect]</span>";
     document.getElementById("domain").value=d.domain;
+    document.getElementById("hdrStatus").textContent=d.domain+" | "+d.total_events+" events | "+d.total_alerts+" alerts";
   } else {
-    ci.innerHTML="<span class='status-dot dot-off'></span>Belum connect. Masukin domain di atas.";
+    ci.innerHTML="<span class='status-dot dot-off'></span>Belum connect.";
+    document.getElementById("hdrStatus").textContent="v2.0";
   }
+
+  // Threat ring
   const l=d.threat;
   const lvl=l>=70?"CRITICAL":l>=40?"WARNING":l>=20?"ELEVATED":"AMAN";
   const cls=lvl.toLowerCase();
   document.getElementById("ring").className="r "+(cls==="aman"?"n":cls==="elevated"?"e":cls==="warning"?"w":"cr");
   document.getElementById("rv").textContent=l;
   document.getElementById("rl").textContent=lvl;
-  document.getElementById("infoBox").innerHTML="<b>Domain:</b> "+(d.domain||"—")+"<br><b>Uptime:</b> "+d.uptime+"<br><b>Avg Latency:</b> "+d.avg_latency+"ms<br><b>Total Events:</b> "+d.total_events+"<br><b>Total Alerts:</b> "+d.total_alerts;
-  const sf=document.getElementById("scoreFill");
-  sf.style.width=l+"%";
-  sf.style.background=l>=70?"#ff3333":l>=40?"#ffaa00":l>=20?"#00aaff":"#00ff88";
-  document.getElementById("scoreText").textContent=l+"/100";
-  document.getElementById("findings").innerHTML=d.findings.map(f=>{
-    const cls=f.result==="OK"?"tag-ok":f.result==="EXPOSED"||f.result==="DOWN"?"tag-crit":"tag-warn";
-    return "<span class='tag "+cls+"'>"+f.check_type+": "+f.result+" ("+f.score+")</span>";
+
+  // Category bars
+  const cats=d.category_scores||{};
+  const catNames={uptime:"Uptime",ssl:"SSL",headers:"Headers",paths:"Paths"};
+  document.getElementById("catBars").innerHTML=Object.keys(catNames).map(k=>{
+    const v=cats[k]||0;
+    const inv=100-v; // lower score = better for security
+    return "<div class='cat-row'><div class='cat-label'>"+catNames[k]+"</div><div class='cat-bar'><div class='cat-fill' style='width:"+inv+"%;background:"+barColor(v)+"'></div></div><div class='cat-val' style='color:"+barColor(v)+"'>"+v+"</div></div>";
   }).join("");
-  document.getElementById("tal").innerHTML=d.alerts.map(a=>"<tr><td>"+a.ts+"</td><td>"+a.rule+"</td><td class='sev-"+a.sev+"'>"+a.sev+"</td><td>"+a.msg+"</td></tr>").join("")||"<tr><td colspan=4 style='color:#555'>No alerts</td></tr>";
+
+  // Info grid
+  const ig=document.getElementById("infoGrid");
+  ig.innerHTML="<div class='info-item'><div class='ik'>Uptime</div><div class='iv'>"+d.uptime+"</div></div>"+
+    "<div class='info-item'><div class='ik'>Avg Latency</div><div class='iv'>"+d.avg_latency+"ms</div></div>"+
+    "<div class='info-item'><div class='ik'>Events</div><div class='iv'>"+d.total_events+"</div></div>"+
+    "<div class='info-item'><div class='ik'>Alerts</div><div class='iv'>"+d.total_alerts+"</div></div>";
+
+  // Response time chart
+  const rt=d.response_times||[];
+  const maxMs=Math.max(...rt.map(r=>r.ms),1);
+  document.getElementById("rtChart").innerHTML=rt.map(r=>{
+    const h=Math.max(4,r.ms/maxMs*100);
+    const c=r.ms>3000?"#f85149":r.ms>1000?"#d29922":"#3fb950";
+    return "<div class='chart-bar' style='height:"+h+"%;background:linear-gradient(to top,"+c+"44,"+c+")'><div class='tip'>"+r.ms+"ms</div></div>";
+  }).join("");
+
+  // Findings
+  document.getElementById("findingsBox").innerHTML=(d.findings||[]).map(f=>{
+    const cls=f.result==="OK"?"tag-ok":f.result==="EXPOSED"||f.result==="DOWN"?"tag-crit":"tag-warn";
+    return "<span class='tag "+cls+"'>"+f.check_type+": "+f.result+"</span>";
+  }).join("")||"<span style='color:#484f58;font-size:11px'>No findings yet</span>";
+
+  // Scan history mini chart
+  const sh=d.scan_history||[];
+  const maxS=Math.max(...sh.map(s=>s.score),1);
+  document.getElementById("histChart").innerHTML=sh.map(s=>{
+    const h=Math.max(3,s.score/maxS*100);
+    return "<div class='hist-bar' style='height:"+h+"%;background:"+barColor(s.score)+"' title='Score: "+s.score+"'></div>";
+  }).join("")||"";
+
+  // Alerts table
+  document.getElementById("tal").innerHTML=d.alerts.map(a=>"<tr><td style='white-space:nowrap'>"+a.ts+"</td><td class='sev-"+a.sev+"'>"+a.sev+"</td><td>"+a.rule+"</td><td style='color:#8b949e'>"+a.msg+"</td></tr>").join("")||"<tr><td colspan=4 style='color:#484f58'>No alerts</td></tr>";
+
+  // Events table
   document.getElementById("tev").innerHTML=d.events.map(e=>{
     const c=e.result==="OK"?"ok":e.result==="EXPOSED"||e.result==="DOWN"?"err":"warn";
-    return "<tr><td>"+e.check_type+"</td><td class='"+c+"'>"+e.result+"</td><td>"+e.score+"</td><td style='color:#888'>"+e.detail+"</td></tr>";
-  }).join("")||"<tr><td colspan=4 style='color:#555'>No scan results yet</td></tr>";
+    return "<tr><td>"+e.check_type+"</td><td class='"+c+"'>"+e.result+"</td><td>"+e.score+"</td><td style='color:#8b949e;max-width:300px;overflow:hidden;text-overflow:ellipsis'>"+e.detail+"</td></tr>";
+  }).join("")||"<tr><td colspan=4 style='color:#484f58'>No scan results yet</td></tr>";
 });}
 setInterval(u,3000);u();
 </script></body></html>"""
 
 # ── HTTP Handler ──────────────────────────────────────────────────────────
+def _get_category_scores(domain):
+    cats = {}
+    for cat in ("uptime", "ssl", "headers", "paths"):
+        rows = db_query("SELECT score FROM events WHERE domain=? AND check_type=? ORDER BY id DESC LIMIT 1", (domain, cat))
+        cats[cat] = rows[0]["score"] if rows else 0
+    return cats
+
+def _get_response_times(domain):
+    rows = db_query("SELECT ts, detail FROM events WHERE domain=? AND check_type='uptime' AND result != 'DOWN' ORDER BY id DESC LIMIT 15", (domain,))
+    times = []
+    for r in reversed(rows):
+        m = re.search(r"(\d+)ms", r.get("detail", ""))
+        times.append({"ts": r["ts"][-8:], "ms": int(m.group(1)) if m else 0})
+    return times
+
 def _json_resp(handler, data):
     handler.send_response(200)
     handler.send_header("Content-Type", "application/json")
@@ -467,6 +572,9 @@ class DashHandler(SimpleHTTPRequestHandler):
                 "findings": [{"check_type": f["check_type"], "result": f["result"], "score": f["score"]} for f in findings],
                 "events": [{"ts": e["ts"], "check_type": e["check_type"], "result": e["result"], "score": e["score"], "detail": e["detail"]} for e in events],
                 "alerts": [{"ts": a["ts"], "rule": a["rule"], "sev": a["severity"], "msg": a["message"]} for a in alerts],
+                "scan_history": SCAN_HISTORY[-15:],
+                "category_scores": _get_category_scores(domain),
+                "response_times": _get_response_times(domain),
             })
         else:
             self.send_response(200)
