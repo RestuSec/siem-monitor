@@ -169,7 +169,13 @@ def _groq_chat(messages):
     text = data["choices"][0]["message"]["content"]
     # filter <think> artifacts
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    return text
+    # strip markdown + html formatting
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"<b>(.+?)</b>", r"\1", text)
+    text = re.sub(r"<i>(.+?)</i>", r"\1", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return text.strip()
 
 def ai_chat(user_msg):
     """Chat dengan AI tentang keamanan website."""
