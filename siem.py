@@ -161,6 +161,7 @@ def ai_analyze(alerts):
         headers={
             "Authorization": f"Bearer {GROQ_KEY}",
             "Content-Type": "application/json",
+            "User-Agent": "SIEM-Monitor/4.0",
         },
     )
     try:
