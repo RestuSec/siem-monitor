@@ -150,7 +150,7 @@ def ai_analyze(alerts):
         "Respond in Indonesian, max 200 words."
     )
     payload = json.dumps({
-        "model": "llama-3.3-70b-versatile",
+        "model": "qwen/qwen3.6-27b",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 500,
         "temperature": 0.3,
@@ -167,7 +167,7 @@ def ai_analyze(alerts):
         resp = urllib.request.urlopen(req, timeout=30)
         data = json.loads(resp.read())
         text = data["choices"][0]["message"]["content"]
-        return {"analysis": text, "model": data.get("model", "llama-3.3-70b-versatile")}
+        return {"analysis": text, "model": data.get("model", "qwen/qwen3.6-27b")}
     except Exception as e:
         return {"error": str(e)}
 
