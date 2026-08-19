@@ -1,6 +1,9 @@
 """SIEM Monitor — masukin domain, langsung scan keamanan + log monitoring.
 
 Cara pakai:
+    $env:GROQ_API_KEY="gsk_..."
+    $env:TELEGRAM_TOKEN="..."
+    $env:TELEGRAM_CHAT_ID="..."
     python siem.py
     python siem.py --log /path/to/access.log
 
@@ -125,34 +128,28 @@ def alert(domain, rule, severity, message, score):
     )
     icon = {"CRITICAL": "!!!", "HIGH": "!!", "MEDIUM": "!", "LOW": "."}.get(severity, ".")
     print(f"  [{icon}] {severity}: {message}")
+    if severity in ("CRITICAL", "HIGH"):
+        emoji = {"CRITICAL": "🔴", "HIGH": "🟠"}.get(severity, "⚪")
+        tg_send(f"{emoji} <b>SIEM Alert</b>\n{severity}: {rule}\n{message}\nDomain: {domain or '-'}")
 
 # ── AI Analysis (Groq) ────────────────────────────────────────────────────
 GROQ_KEY = os.getenv("GROQ_API_KEY", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+AI_SYSTEM = (
+    "Kamu adalah ahli keamanan siber (SIEM Analyst) yang bekerja untuk RestuSec. "
+    "Selalu jawab dalam Bahasa Indonesia. "
+    "Kamu memantau website restusec.my.id yang berjalan di Python FastAPI + Cloudflare Tunnel. "
+    "Jika ditanya sesuatu, jawab singkat, jelas, langsung ke intinya. "
+    "Jika ada serangan, langsung kasih rekomendasi aksi yang bisa dilakukan."
+)
+AI_CHAT_HISTORY = []  # max 10 messages
 
-def ai_analyze(alerts):
-    """Send alerts to Groq AI for analysis."""
-    if not GROQ_KEY:
-        return {"error": "No API key. Set GROQ_API_KEY env var."}
-    if not alerts:
-        return {"error": "No alerts to analyze."}
-
-    alert_text = "\n".join(
-        f"- [{a['severity']}] {a['rule']}: {a['message']} (at {a['ts']})"
-        for a in alerts[:15]
-    )
-    prompt = (
-        "You are a cybersecurity analyst. Analyze these security alerts and provide:\n"
-        "1. Attack pattern summary (what's happening)\n"
-        "2. Risk assessment (is this targeted or random?)\n"
-        "3. Recommended actions (block IP, patch, etc.)\n"
-        "4. Threat level (1-10)\n\n"
-        f"Alerts:\n{alert_text}\n\n"
-        "Respond in Indonesian, max 200 words."
-    )
+def _groq_chat(messages):
     payload = json.dumps({
         "model": "qwen/qwen3.6-27b",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 500,
+        "messages": messages,
+        "max_tokens": 600,
         "temperature": 0.3,
     }).encode()
     req = urllib.request.Request(
@@ -164,15 +161,105 @@ def ai_analyze(alerts):
             "User-Agent": "SIEM-Monitor/4.0",
         },
     )
+    resp = urllib.request.urlopen(req, timeout=30)
+    data = json.loads(resp.read())
+    return data["choices"][0]["message"]["content"]
+
+def ai_chat(user_msg):
+    """Chat dengan AI tentang keamanan website."""
+    if not GROQ_KEY:
+        return {"error": "API key belum diatur."}
+    domain = CONFIG.get("domain", "")
+    recent_alerts = db_query("SELECT ts, rule, severity, message FROM alerts ORDER BY id DESC LIMIT 10")
+    recent_requests = db_query("SELECT ts, ip, method, path, status, attack FROM requests WHERE attack IS NOT NULL ORDER BY id DESC LIMIT 10")
+    ctx = f"Domain aktif: {domain or 'belum connect'}\n"
+    if recent_alerts:
+        ctx += "Alert terakhir:\n" + "\n".join(f"- [{a['severity']}] {a['rule']}: {a['message']}" for a in recent_alerts[:5]) + "\n"
+    if recent_requests:
+        ctx += "Request mencurigakan:\n" + "\n".join(f"- {r['method']} {r['path']} → {r['status']} [{r['attack']}]" for r in recent_requests[:5]) + "\n"
+    AI_CHAT_HISTORY.append({"role": "user", "content": user_msg})
+    if len(AI_CHAT_HISTORY) > 10:
+        AI_CHAT_HISTORY.pop(0)
+    msgs = [{"role": "system", "content": AI_SYSTEM + "\n\n" + ctx}] + AI_CHAT_HISTORY
     try:
-        resp = urllib.request.urlopen(req, timeout=30)
-        data = json.loads(resp.read())
-        text = data["choices"][0]["message"]["content"]
-        return {"analysis": text, "model": data.get("model", "qwen/qwen3.6-27b")}
+        reply = _groq_chat(msgs)
+        AI_CHAT_HISTORY.append({"role": "assistant", "content": reply})
+        if len(AI_CHAT_HISTORY) > 10:
+            AI_CHAT_HISTORY.pop(0)
+        return {"reply": reply}
     except Exception as e:
         return {"error": str(e)}
 
-# ── Checks ───────────────────────────────────────────────────────────────
+def ai_analyze(alerts):
+    """Auto-analyze alerts — kasih peringatan otomatis."""
+    if not GROQ_KEY:
+        return {"error": "API key belum diatur."}
+    if not alerts:
+        return {"error": "Tidak ada alert untuk dianalisis."}
+    alert_text = "\n".join(
+        f"- [{a['severity']}] {a['rule']}: {a['message']} (at {a['ts']})"
+        for a in alerts[:15]
+    )
+    events = db_query("SELECT check_type, result, detail, score FROM events WHERE domain=? ORDER BY id DESC LIMIT 10", (CONFIG.get("domain", ""),))
+    event_text = "\n".join(f"- {e['check_type']}: {e['result']} (score: {e['score']}) — {e['detail']}" for e in events[:10])
+    prompt = (
+        "Kamu adalah ahli keamanan siber. Analisis alert berikut dari website restusec.my.id.\n\n"
+        f"ALERTS:\n{alert_text}\n\n"
+        f"SCAN RESULTS:\n{event_text}\n\n"
+        "Kasih:\n"
+        "1. Ringkasan pola serangan\n"
+        "2. Apakah ini serangan terarah atau random?\n"
+        "3. Rekomendasi aksi konkret\n"
+        "4. Level ancaman (1-10)\n"
+        "5. Apakah ada yang perlu di-block sekarang?\n\n"
+        "Jawab dalam Bahasa Indonesia, singkat, langsung ke inti."
+    )
+    try:
+        reply = _groq_chat([{"role": "user", "content": prompt}])
+        return {"analysis": reply, "model": "qwen/qwen3.6-27b"}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ── Telegram Notification ────────────────────────────────────────────────
+def tg_send(text):
+    """Kirim pesan ke Telegram."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except Exception:
+        return False
+
+_last_alert_id = 0
+def tg_check_new_alerts():
+    """Cek alert baru, kirim ke Telegram."""
+    global _last_alert_id
+    alerts = db_query("SELECT id, ts, rule, severity, message FROM alerts ORDER BY id DESC LIMIT 5")
+    if not alerts:
+        return
+    newest_id = alerts[0]["id"]
+    if _last_alert_id == 0:
+        _last_alert_id = newest_id
+        return
+    for a in alerts:
+        if a["id"] > _last_alert_id:
+            icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "⚪"}.get(a["severity"], "⚪")
+            text = (
+                f"{icon} <b>SIEM Alert — {a['severity']}</b>\n"
+                f"Rule: {a['rule']}\n"
+                f"Pesan: {a['message']}\n"
+                f"Waktu: {a['ts']}\n"
+                f"Domain: {CONFIG.get('domain', '-')}"
+            )
+            tg_send(text)
+    _last_alert_id = newest_id
 def check_ssl(domain):
     """SSL cert check: expiry, issuer."""
     score = 0
@@ -523,6 +610,34 @@ def log_rules_loop():
         except Exception:
             pass
 
+def ai_auto_loop():
+    """Auto-analyze alerts tiap 2 menit."""
+    while True:
+        time.sleep(120)
+        try:
+            if GROQ_KEY and CONFIG.get("domain"):
+                alerts = db_query("SELECT ts, rule, severity, message FROM alerts ORDER BY id DESC LIMIT 10")
+                if alerts:
+                    result = ai_analyze(alerts)
+                    if result.get("analysis"):
+                        # Simpan ke DB
+                        db_exec(
+                            "INSERT INTO alerts (ts, rule, severity, message, score) VALUES (?, ?, ?, ?, ?)",
+                            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "AI_ANALYSIS", "INFO",
+                             result["analysis"][:500], 0)
+                        )
+        except Exception:
+            pass
+
+def tg_check_loop():
+    """Cek alert baru tiap 30 detik, kirim ke Telegram."""
+    while True:
+        time.sleep(30)
+        try:
+            tg_check_new_alerts()
+        except Exception:
+            pass
+
 # ── Monitor loop ─────────────────────────────────────────────────────────
 def monitor_loop():
     while True:
@@ -650,13 +765,31 @@ tr:hover{background:#161b22}
   <div class="c"><h2>Request Log</h2><div style="max-height:220px;overflow-y:auto"><table><thead><tr><th>Time</th><th>IP</th><th>Method</th><th>Path</th><th>Status</th><th>Attack</th></tr></thead><tbody id="treq"></tbody></table></div></div>
 </div>
 
-<div class="row r1" style="grid-template-columns:1fr">
+<div class="row r2">
   <div class="c"><h2>AI Analysis</h2>
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
       <button onclick="aiAnalyze()" id="btnAI" style="background:#8957e5;color:#fff;border:none;padding:8px 16px;border-radius:6px;font-family:monospace;font-weight:bold;cursor:pointer;font-size:11px;text-transform:uppercase;letter-spacing:1px">Analyze with AI</button>
-      <span id="aiStatus" style="font-size:10px;color:#8b949e">Click to analyze alerts with Groq AI</span>
+      <span id="aiStatus" style="font-size:10px;color:#8b949e">Analisis otomatis tiap 2 menit</span>
     </div>
-    <div id="aiResult" style="background:#161b22;border:1px solid #21262d;border-radius:6px;padding:12px;font-size:12px;color:#e0e0e0;white-space:pre-wrap;max-height:300px;overflow-y:auto;display:none"></div>
+    <div id="aiResult" style="background:#161b22;border:1px solid #21262d;border-radius:6px;padding:12px;font-size:12px;color:#e0e0e0;white-space:pre-wrap;max-height:250px;overflow-y:auto;display:none"></div>
+  </div>
+  <div class="c"><h2>Chat dengan AI</h2>
+    <div id="chatBox" style="background:#161b22;border:1px solid #21262d;border-radius:6px;padding:10px;height:200px;overflow-y:auto;margin-bottom:8px;font-size:12px">
+      <div style="color:#484f58;font-size:11px">Tanya apa aja soal keamanan website lo...</div>
+    </div>
+    <div style="display:flex;gap:6px">
+      <input type="text" id="chatInput" placeholder="Tanya AI..." style="flex:1;background:#0d1117;border:1px solid #30363d;color:#e0e0e0;padding:8px 12px;border-radius:6px;font-family:monospace;font-size:12px" onkeydown="if(event.key==='Enter')sendChat()">
+      <button onclick="sendChat()" id="btnChat" style="background:#8957e5;color:#fff;border:none;padding:8px 14px;border-radius:6px;font-family:monospace;font-weight:bold;cursor:pointer;font-size:11px">KIRIM</button>
+    </div>
+  </div>
+</div>
+
+<div class="row r1" style="grid-template-columns:1fr">
+  <div class="c"><h2>Telegram Notifications</h2>
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:11px;color:#8b949e" id="tgStatus">Alert baru otomatis dikirim ke Telegram lo.</span>
+      <button onclick="testTg()" style="background:#0088cc;color:#fff;border:none;padding:6px 12px;border-radius:6px;font-family:monospace;font-size:10px;cursor:pointer">TEST</button>
+    </div>
   </div>
 </div>
 </div>
@@ -749,12 +882,36 @@ function aiAnalyze(){
   const btn=document.getElementById("btnAI");
   const st=document.getElementById("aiStatus");
   const res=document.getElementById("aiResult");
-  btn.disabled=true;btn.textContent="ANALYZING...";st.textContent="Sending alerts to AI...";
+  btn.disabled=true;btn.textContent="ANALYZING...";st.textContent="Menganalisis alerts...";
   fetch("/api/ai-analyze",{method:"POST"}).then(r=>r.json()).then(d=>{
     btn.disabled=false;btn.textContent="ANALYZE WITH AI";
     if(d.error){st.textContent="Error: "+d.error;res.style.display="none";}
     else{st.textContent="Model: "+d.model;res.textContent=d.analysis;res.style.display="block";}
   }).catch(e=>{btn.disabled=false;btn.textContent="ANALYZE WITH AI";st.textContent="Error: "+e;});
+}
+function sendChat(){
+  const inp=document.getElementById("chatInput");
+  const box=document.getElementById("chatBox");
+  const msg=inp.value.trim();
+  if(!msg)return;
+  box.innerHTML+="<div style='color:#58a6ff;margin-top:6px'><b>Lo:</b> "+msg+"</div>";
+  inp.value="";
+  box.innerHTML+="<div style='color:#484f58;margin-top:4px;font-style:italic'>AI sedang berpikir...</div>";
+  box.scrollTop=box.scrollHeight;
+  fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message:msg})}).then(r=>r.json()).then(d=>{
+    const last=box.lastElementChild;
+    if(d.error){last.outerHTML="<div style='color:#f85149;margin-top:4px'><b>Error:</b> "+d.error+"</div>";}
+    else{last.outerHTML="<div style='color:#3fb950;margin-top:6px'><b>AI:</b> "+d.reply+"</div>";}
+    box.scrollTop=box.scrollHeight;
+  }).catch(e=>{box.lastElementChild.outerHTML="<div style='color:#f85149;margin-top:4px'><b>Error:</b> "+e+"</div>";});
+}
+function testTg(){
+  const st=document.getElementById("tgStatus");
+  st.textContent="Mengirim test...";
+  fetch("/api/send-test-tg",{method:"POST"}).then(r=>r.json()).then(d=>{
+    if(d.ok){st.textContent="Test terkirim! Cek Telegram lo.";st.style.color="#3fb950";}
+    else{st.textContent="Gagal. Cek TELEGRAM_TOKEN & TELEGRAM_CHAT_ID.";st.style.color="#f85149";}
+  }).catch(e=>{st.textContent="Error: "+e;st.style.color="#f85149";});
 }
 </script></body></html>"""
 
@@ -853,6 +1010,18 @@ class DashHandler(SimpleHTTPRequestHandler):
             result = ai_analyze(alerts)
             _json_resp(self, result)
             return
+        elif self.path == "/api/chat":
+            msg = body.get("message", "").strip()
+            if not msg:
+                _json_resp(self, {"error": "Kosong."})
+                return
+            result = ai_chat(msg)
+            _json_resp(self, result)
+            return
+        elif self.path == "/api/send-test-tg":
+            ok = tg_send("SIEM Monitor: Test notification berhasil!")
+            _json_resp(self, {"ok": ok})
+            return
 
         self.send_response(404)
         self.end_headers()
@@ -896,12 +1065,18 @@ def main():
     threading.Thread(target=log_rules_loop, daemon=True).start()
     if LOG_PATH:
         threading.Thread(target=watch_log, daemon=True).start()
+    threading.Thread(target=ai_auto_loop, daemon=True).start()
+    threading.Thread(target=tg_check_loop, daemon=True).start()
 
     print(f"  Dashboard: http://localhost:{DASHBOARD_PORT}")
     if CONFIG["domain"]:
         print(f"  Monitoring: {CONFIG['domain']}")
     if LOG_PATH:
         print(f"  Log file: {LOG_PATH}")
+    if TELEGRAM_TOKEN:
+        print(f"  Telegram: aktif")
+    if GROQ_KEY:
+        print(f"  AI (Groq): aktif")
     print("=" * 50)
 
     try:
