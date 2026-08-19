@@ -17,6 +17,7 @@ import urllib.request
 import urllib.error
 import ssl
 import socket
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -124,6 +125,51 @@ def alert(domain, rule, severity, message, score):
     )
     icon = {"CRITICAL": "!!!", "HIGH": "!!", "MEDIUM": "!", "LOW": "."}.get(severity, ".")
     print(f"  [{icon}] {severity}: {message}")
+
+# ── AI Analysis (Groq) ────────────────────────────────────────────────────
+GROQ_KEY = os.getenv("GROQ_API_KEY", "")
+
+def ai_analyze(alerts):
+    """Send alerts to Groq AI for analysis."""
+    if not GROQ_KEY:
+        return {"error": "No API key. Set GROQ_API_KEY env var."}
+    if not alerts:
+        return {"error": "No alerts to analyze."}
+
+    alert_text = "\n".join(
+        f"- [{a['severity']}] {a['rule']}: {a['message']} (at {a['ts']})"
+        for a in alerts[:15]
+    )
+    prompt = (
+        "You are a cybersecurity analyst. Analyze these security alerts and provide:\n"
+        "1. Attack pattern summary (what's happening)\n"
+        "2. Risk assessment (is this targeted or random?)\n"
+        "3. Recommended actions (block IP, patch, etc.)\n"
+        "4. Threat level (1-10)\n\n"
+        f"Alerts:\n{alert_text}\n\n"
+        "Respond in Indonesian, max 200 words."
+    )
+    payload = json.dumps({
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 500,
+        "temperature": 0.3,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {GROQ_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        data = json.loads(resp.read())
+        text = data["choices"][0]["message"]["content"]
+        return {"analysis": text, "model": data.get("model", "llama-3.3-70b-versatile")}
+    except Exception as e:
+        return {"error": str(e)}
 
 # ── Checks ───────────────────────────────────────────────────────────────
 def check_ssl(domain):
@@ -602,6 +648,16 @@ tr:hover{background:#161b22}
   <div class="c"><h2>Alerts</h2><div style="max-height:220px;overflow-y:auto"><table><thead><tr><th>Time</th><th>Severity</th><th>Rule</th><th>Message</th></tr></thead><tbody id="tal"></tbody></table></div></div>
   <div class="c"><h2>Request Log</h2><div style="max-height:220px;overflow-y:auto"><table><thead><tr><th>Time</th><th>IP</th><th>Method</th><th>Path</th><th>Status</th><th>Attack</th></tr></thead><tbody id="treq"></tbody></table></div></div>
 </div>
+
+<div class="row r1" style="grid-template-columns:1fr">
+  <div class="c"><h2>AI Analysis</h2>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+      <button onclick="aiAnalyze()" id="btnAI" style="background:#8957e5;color:#fff;border:none;padding:8px 16px;border-radius:6px;font-family:monospace;font-weight:bold;cursor:pointer;font-size:11px;text-transform:uppercase;letter-spacing:1px">Analyze with AI</button>
+      <span id="aiStatus" style="font-size:10px;color:#8b949e">Click to analyze alerts with Groq AI</span>
+    </div>
+    <div id="aiResult" style="background:#161b22;border:1px solid #21262d;border-radius:6px;padding:12px;font-size:12px;color:#e0e0e0;white-space:pre-wrap;max-height:300px;overflow-y:auto;display:none"></div>
+  </div>
+</div>
 </div>
 
 <script>
@@ -688,6 +744,17 @@ function u(){fetch("/api").then(r=>r.json()).then(d=>{
   }).join("")||"<tr><td colspan=6 style='color:#484f58'>No log file connected. Start with: python siem.py --log access.log</td></tr>";
 });}
 setInterval(u,3000);u();
+function aiAnalyze(){
+  const btn=document.getElementById("btnAI");
+  const st=document.getElementById("aiStatus");
+  const res=document.getElementById("aiResult");
+  btn.disabled=true;btn.textContent="ANALYZING...";st.textContent="Sending alerts to AI...";
+  fetch("/api/ai-analyze",{method:"POST"}).then(r=>r.json()).then(d=>{
+    btn.disabled=false;btn.textContent="ANALYZE WITH AI";
+    if(d.error){st.textContent="Error: "+d.error;res.style.display="none";}
+    else{st.textContent="Model: "+d.model;res.textContent=d.analysis;res.style.display="block";}
+  }).catch(e=>{btn.disabled=false;btn.textContent="ANALYZE WITH AI";st.textContent="Error: "+e;});
+}
 </script></body></html>"""
 
 # ── HTTP Handler ──────────────────────────────────────────────────────────
@@ -780,6 +847,11 @@ class DashHandler(SimpleHTTPRequestHandler):
             db_save_config()
             _json_resp(self, {"ok": True})
             return
+        elif self.path == "/api/ai-analyze":
+            alerts = db_query("SELECT ts, rule, severity, message FROM alerts ORDER BY id DESC LIMIT 15")
+            result = ai_analyze(alerts)
+            _json_resp(self, result)
+            return
 
         self.send_response(404)
         self.end_headers()
@@ -794,9 +866,9 @@ def main():
         if arg == "--log" and i < len(sys.argv):
             LOG_PATH = sys.argv[i + 1]
 
-    print("=" * 50)
-    print("  SIEM MONITOR v3")
-    print("=" * 50)
+  print("=" * 50)
+  print("  SIEM MONITOR v4.0 — AI Powered")
+  print("=" * 50)
 
     init_db()
     db_load_config()

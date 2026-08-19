@@ -1,9 +1,10 @@
-# SIEM Monitor v3.1
+# SIEM Monitor v4.0
 
-Real-time Security Information and Event Monitoring untuk website. Zero dependencies — Python stdlib only.
+Real-time Security Information and Event Monitoring untuk website. Zero dependencies — Python stdlib only + Groq AI.
 
 ![Security Score](https://img.shields.io/badge/Security_Score-100/100-3fb950?style=flat-square)
 ![Threat Level](https://img.shields.io/badge/Threat_Level-Real--Time-f85149?style=flat-square)
+![AI Powered](https://img.shields.io/badge/AI-Groq-8957e5?style=flat-square&logo=ai&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776ab?style=flat-square&logo=python&logoColor=white)
 
 ## Demo
@@ -21,6 +22,7 @@ Real-time Security Information and Event Monitoring untuk website. Zero dependen
 | **12 Attack Types** | SQLI, XSS, LFI, PATH_TRAVERSAL, DDoS, BRUTE_FORCE, FLOOD, TOOL_SCAN, METHOD_ANOMALY, SENSITIVE_FILE, ADMIN_SCAN, SERVER_ERR |
 | **External Scanner** | SSL/TLS check, security headers, sensitive path probing (tiap 30s) |
 | **Log Monitoring** | Tails uvicorn access log, real-time attack detection |
+| **AI Analysis** | Groq AI menganalisis alerts — attack pattern, risk assessment, rekomendasi |
 | **Threat Level** | Exponential decay — naik saat serangan, turun otomatis setelah berhenti |
 | **Dark Dashboard** | GitHub-style UI, live update tiap 3 detik |
 | **Zero Dependencies** | Python stdlib only — `http.server`, `sqlite3`, `urllib`, `ssl`, `re` |
@@ -50,6 +52,10 @@ Real-time Security Information and Event Monitoring untuk website. Zero dependen
 git clone https://github.com/RestuSec/siem-monitor.git
 cd siem-monitor
 
+# Set AI API key (optional, for AI analysis)
+$env:GROQ_API_KEY="gsk_..."  # Windows PowerShell
+# export GROQ_API_KEY="gsk_..."  # Linux/Mac
+
 # Run dashboard only (external scanning)
 python siem.py
 
@@ -57,7 +63,7 @@ python siem.py
 python siem.py --log /path/to/access.log
 ```
 
-Buka **http://localhost:5000** → Connect → masukkan domain website lo.
+Buka **http://localhost:5000** → Connect → masukkan domain website lo → klik **Analyze with AI**.
 
 ## Setup Lengkap
 
