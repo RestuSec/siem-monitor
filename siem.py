@@ -466,10 +466,23 @@ def check_paths(domain):
 
 def check_uptime(domain):
     """Quick uptime + response check."""
+    # cek localhost dulu
+    local_ok = False
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8001/", headers=HEADERS)
+        urllib.request.urlopen(req, timeout=3)
+        local_ok = True
+    except Exception:
+        pass
+
     url = f"https://{domain}"
     status, headers, body, ms = _safe_fetch(url)
 
     if status == 0:
+        if local_ok:
+            # server lokal OK, cuma tunnel yang bermasalah
+            log_event(domain, "uptime", "OK", f"Local OK, tunnel slow ({ms}ms)", 5)
+            return 5
         alert(domain, "SITE_DOWN", "CRITICAL", f"{domain} unreachable", 50)
         log_event(domain, "uptime", "DOWN", "Connection failed", 50)
         return 50
