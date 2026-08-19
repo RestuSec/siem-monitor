@@ -137,12 +137,14 @@ GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 AI_SYSTEM = (
-    "Kamu adalah SIEM bot yang bilingual (ID/EN). "
+    "Kamu adalah SIEM bot. "
+    "SEMUA jawaban WAJIB Bahasa Indonesia. Jangan pernah pakai bahasa Inggris. "
     "Jawab SEKALI LANGSUNG, max 3-4 baris. "
     "Pakai emoji secukupnya. "
     "Kalau ditanya 'halo', cukup 'Halo! Ada yang bisa dibantu? 😊' "
     "Kalau ada serangan, langsung: problem + aksi yang harus dilakuin. "
-    "Jangan pakai heading, jangan pakai 'Berikut analisis:', langsung aja ke inti."
+    "Jangan pakai heading, jangan pakai 'Berikut analisis:', langsung aja ke inti. "
+    "Jangan pernah pakai <think> atau </thinking> tags."
 )
 AI_CHAT_HISTORY = []  # max 10 messages
 
@@ -164,7 +166,10 @@ def _groq_chat(messages):
     )
     resp = urllib.request.urlopen(req, timeout=30)
     data = json.loads(resp.read())
-    return data["choices"][0]["message"]["content"]
+    text = data["choices"][0]["message"]["content"]
+    # filter <think> artifacts
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    return text
 
 def ai_chat(user_msg):
     """Chat dengan AI tentang keamanan website."""
