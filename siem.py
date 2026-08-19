@@ -1,7 +1,8 @@
-"""SIEM Monitor — masukin domain, langsung scan keamanan.
+"""SIEM Monitor — masukin domain, langsung scan keamanan + log monitoring.
 
 Cara pakai:
     python siem.py
+    python siem.py --log /path/to/access.log
 
 Dashboard: http://localhost:5000
 """
@@ -19,12 +20,18 @@ import socket
 from datetime import datetime, timedelta
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+from socketserver import ThreadingMixIn
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
 DB_PATH = Path(__file__).parent / "siem.db"
 DASHBOARD_PORT = 5000
+LOG_PATH = None  # set via --log
 
 CONFIG = {"domain": None, "interval": 30}
-SCAN_HISTORY = []  # in-memory: [{"ts": ..., "score": ..., "ssl": ..., "headers": ..., "paths": ..., "uptime": ...}]
+SCAN_HISTORY = []
+REQUEST_LOG = []  # recent parsed requests for dashboard
 
 # ── DB ───────────────────────────────────────────────────────────────────
 def init_db():
@@ -41,11 +48,17 @@ def init_db():
         CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY, value TEXT
         );
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT, ip TEXT, method TEXT, path TEXT, status INTEGER, attack TEXT
+        );
     """)
     conn.close()
 
 def _conn():
-    return sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    c = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=5)
+    c.execute("PRAGMA journal_mode=WAL")
+    return c
 
 def db_exec(sql, params=()):
     c = _conn(); c.execute(sql, params); c.commit(); c.close()
@@ -97,15 +110,17 @@ def log_event(domain, check_type, result, detail, score):
     )
 
 def alert(domain, rule, severity, message, score):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cutoff = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
     recent = db_query(
-        "SELECT id FROM alerts WHERE rule=? AND ts >= datetime('now', '-5 minutes')",
-        (rule,)
+        "SELECT id FROM alerts WHERE rule=? AND ts >= ?",
+        (rule, cutoff)
     )
     if recent:
         return
     db_exec(
         "INSERT INTO alerts (ts, rule, severity, message, score) VALUES (?, ?, ?, ?, ?)",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), rule, severity, message, score)
+        (now_str, rule, severity, message, score)
     )
     icon = {"CRITICAL": "!!!", "HIGH": "!!", "MEDIUM": "!", "LOW": "."}.get(severity, ".")
     print(f"  [{icon}] {severity}: {message}")
@@ -285,21 +300,181 @@ def run_scan(domain):
     return min(100, total)
 
 def threat_level():
-    """Calculate threat from recent alerts. Newer = heavier."""
+    """Calculate threat from recent alerts. Exponential decay — drops fast after attack stops."""
+    cutoff = (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
     rows = db_query(
-        "SELECT score, ts FROM alerts WHERE ts >= datetime('now', '-10 minutes') ORDER BY ts DESC"
+        "SELECT score, ts FROM alerts WHERE ts >= ? ORDER BY ts DESC",
+        (cutoff,)
     )
     if not rows:
         return 0
     total = 0
     now = datetime.now()
-    for i, r in enumerate(rows):
+    for r in rows:
         ts = datetime.strptime(r["ts"], "%Y-%m-%d %H:%M:%S")
         age_min = (now - ts).total_seconds() / 60
-        weight = max(0.2, 1.0 - (age_min / 10))  # newer = higher weight
+        weight = 2.0 ** (-age_min)  # exponential: halves every minute
         total += r["score"] * weight
-    # Normalize: divide by expected max (100 * avg ~5 alerts)
-    return min(100, int(total / 3))
+    return min(100, int(total))
+
+# ── Log monitoring + attack detection ─────────────────────────────────────
+# Paths our own scanner probes — skip these in attack detection
+_SCANNER_PROBES = {"/.env","/.git/config","/wp-admin/","/admin/","/phpmyadmin/",
+                   "/server-status","/server-info","/.htaccess","/backup/",
+                   "/debug/","/swagger/","/actuator","/"}
+
+ATTACK_PATTERNS = {
+    "SQLI": re.compile(r"union\s+select|or\s+1\s*=\s*1|drop\s+table|--\s*$|select\s+\*|insert\s+into|delete\s+from|having\s+1|order\s+by\s+\d|waitfor\s+delay|sleep\(\d|benchmark\(|load_file|into\s+outfile",
+                       re.I),
+    "XSS": re.compile(r"<script|javascript:|on\w+\s*=|<img[^>]+onerror|<svg[^>]+onload|alert\s*\(|document\.cookie|document\.write|eval\s*\(",
+                       re.I),
+    "LFI": re.compile(r"\.\./|\.\.\\|%2e%2e%2f|%2e%2e/|/etc/passwd|/etc/shadow|/proc/self|file://|php://|expect://|input://|/var/log|/var/www",
+                       re.I),
+    "PATH_TRAVERSAL": re.compile(r"/\.\./|/\.\.\\|/\.\.%2f|/\.\.%5c", re.I),
+    "ADMIN_SCAN": re.compile(r"/wp-admin|/phpmyadmin|/admin|/cpanel|/webmail|/cgi-bin|/phpinfo|/info\.php|/test\.php|/debug|/console",
+                             re.I),
+    "SENSITIVE_FILE": re.compile(r"/\.env|/\.git|/\.htaccess|/\.DS_Store|/config\.|/database\.|/backup|/dump\.sql|/composer\.json|/package\.json|/docker-compose|/Dockerfile|/wp-config|/xmlrpc",
+                                 re.I),
+}
+
+# IP tracking for brute force detection
+ip_request_times = {}  # {ip: [timestamp, ...]}
+
+def detect_attack(ip, method, path, status):
+    """Check request against attack patterns. Returns attack type or None."""
+    text = f"{method} {path}"
+    for name, pattern in ATTACK_PATTERNS.items():
+        if pattern.search(text):
+            return name
+    # Method anomaly: PUT/DELETE/PATCH/TRACE/CONNECT
+    if method in ("PUT", "DELETE", "PATCH", "TRACE", "CONNECT"):
+        return "METHOD_ANOMALY"
+    # Long URL: SQL injection combos, encoded payloads
+    if len(path) > 100:
+        return "LONG_URL"
+    # Tool signatures in URL
+    if re.search(r"sqlmap|nikto|nmap|masscan|zgrab|gobuster|dirbuster|wfuzz|ffuf|havij|acunetix", path, re.I):
+        return "TOOL_SCAN"
+    # Flood: many same-path 401/403 = likely brute force or DDoS
+    if status in (401, 403):
+        recent = sum(1 for r in REQUEST_LOG[-50:] if r["ip"] == ip and r["path"] == path)
+        if recent >= 5:
+            return "FLOOD"
+    if status >= 500:
+        return "SERVER_ERR"
+    return None
+
+def log_request(ip, method, path, status, attack):
+    db_exec(
+        "INSERT INTO requests (ts, ip, method, path, status, attack) VALUES (?, ?, ?, ?, ?, ?)",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ip, method, path, status, attack)
+    )
+    # Only add to display buffer if NOT a scanner self-probe
+    if path not in _SCANNER_PROBES:
+        REQUEST_LOG.append({"ts": datetime.now().strftime("%H:%M:%S"), "ip": ip, "method": method, "path": path[:80], "status": status, "attack": attack})
+        if len(REQUEST_LOG) > 200:
+            REQUEST_LOG.pop(0)
+
+def run_log_rules():
+    """Analyze request log for attack patterns."""
+    now = datetime.now()
+    alerts = []
+
+    # DDoS: >50 requests from same IP in 60s (exclude scanner self-probes)
+    placeholders = ",".join("?" for _ in _SCANNER_PROBES)
+    scan_params = list(_SCANNER_PROBES)
+    rows = db_query(
+        f"SELECT ip, COUNT(*) as cnt FROM requests WHERE ts >= ? AND path NOT IN ({placeholders}) GROUP BY ip HAVING cnt >= 50",
+        ((now - timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S"),) + tuple(scan_params)
+    )
+    for r in rows:
+        alerts.append(("DDOS", "CRITICAL", f"DDoS dari {r['ip']}: {r['cnt']} requests/60s", 90))
+
+    # Brute force: >10 requests from same IP in 60s (lower than DDoS, exclude scanner)
+    rows = db_query(
+        f"SELECT ip, COUNT(*) as cnt FROM requests WHERE ts >= ? AND path NOT IN ({placeholders}) GROUP BY ip HAVING cnt >= 10 AND cnt < 50",
+        ((now - timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S"),) + tuple(scan_params)
+    )
+    for r in rows:
+        alerts.append(("BRUTE_FORCE", "HIGH", f"Request flood dari {r['ip']}: {r['cnt']} requests/60s", 40))
+
+    # Attack pattern detection
+    rows = db_query(
+        "SELECT ip, attack, COUNT(*) as cnt FROM requests WHERE attack IS NOT NULL AND ts >= ? GROUP BY ip, attack HAVING cnt >= 1",
+        ((now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S"),)
+    )
+    severity_map = {"SQLI": "CRITICAL", "XSS": "HIGH", "LFI": "CRITICAL", "PATH_TRAVERSAL": "HIGH",
+                    "ADMIN_SCAN": "MEDIUM", "SENSITIVE_FILE": "MEDIUM", "SERVER_ERR": "LOW",
+                    "FLOOD": "HIGH", "METHOD_ANOMALY": "MEDIUM", "LONG_URL": "MEDIUM", "TOOL_SCAN": "HIGH"}
+    score_map = {"SQLI": 80, "XSS": 60, "LFI": 80, "PATH_TRAVERSAL": 50,
+                 "ADMIN_SCAN": 20, "SENSITIVE_FILE": 20, "SERVER_ERR": 10, "FLOOD": 50,
+                 "METHOD_ANOMALY": 30, "LONG_URL": 40, "TOOL_SCAN": 60}
+    for r in rows:
+        sev = severity_map.get(r["attack"], "MEDIUM")
+        score = score_map.get(r["attack"], 20)
+        alerts.append((r["attack"], sev,
+                       f"{r['attack']} dari {r['ip']}: {r['cnt']} requests/5min", score))
+
+    # High error rate from same IP (exclude scanner)
+    rows = db_query(
+        f"SELECT ip, COUNT(*) as total, SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) as bad FROM requests WHERE ts >= ? AND path NOT IN ({placeholders}) GROUP BY ip HAVING total >= 5 AND bad * 1.0 / total >= 0.7",
+        ((now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S"),) + tuple(scan_params)
+    )
+    for r in rows:
+        alerts.append(("ERROR_FLOOD", "MEDIUM", f"Error flood dari {r['ip']}: {r['bad']}/{r['total']} errors", 25))
+
+    for rule, sev, msg, score in alerts:
+        alert("local", rule, sev, msg, score)
+
+    return alerts
+
+# ── Uvicorn access log parser ─────────────────────────────────────────────
+UVICORN_RE = re.compile(
+    r'(?P<ip>\S+):\d+ - "(?P<method>\S+) (?P<path>\S+) \S+" (?P<status>\d{3})'
+)
+
+def watch_log():
+    """Tail access.log, parse, detect attacks."""
+    if not LOG_PATH:
+        return
+    p = Path(LOG_PATH)
+    print(f"  Watching log: {p}")
+
+    if p.exists():
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, 2)
+
+    while True:
+        if not p.exists():
+            time.sleep(1)
+            continue
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, 2)
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.5)
+                    continue
+                m = UVICORN_RE.search(line)
+                if m:
+                    ip = m.group("ip")
+                    method = m.group("method")
+                    path = m.group("path")
+                    status = int(m.group("status"))
+                    # Skip our own scanner probes
+                    attack = None if path in _SCANNER_PROBES else detect_attack(ip, method, path, status)
+                    log_request(ip, method, path, status, attack)
+                    if attack and attack != "SERVER_ERR":
+                        print(f"  [!] {attack}: {ip} {method} {path} → {status}")
+
+# Run log rules on a timer (every 15s), not modulo-based
+def log_rules_loop():
+    while True:
+        time.sleep(15)
+        try:
+            run_log_rules()
+        except Exception:
+            pass
 
 # ── Monitor loop ─────────────────────────────────────────────────────────
 def monitor_loop():
@@ -425,7 +600,7 @@ tr:hover{background:#161b22}
 
 <div class="row r2">
   <div class="c"><h2>Alerts</h2><div style="max-height:220px;overflow-y:auto"><table><thead><tr><th>Time</th><th>Severity</th><th>Rule</th><th>Message</th></tr></thead><tbody id="tal"></tbody></table></div></div>
-  <div class="c"><h2>Scan Events</h2><div style="max-height:220px;overflow-y:auto"><table><thead><tr><th>Check</th><th>Result</th><th>Score</th><th>Detail</th></tr></thead><tbody id="tev"></tbody></table></div></div>
+  <div class="c"><h2>Request Log</h2><div style="max-height:220px;overflow-y:auto"><table><thead><tr><th>Time</th><th>IP</th><th>Method</th><th>Path</th><th>Status</th><th>Attack</th></tr></thead><tbody id="treq"></tbody></table></div></div>
 </div>
 </div>
 
@@ -442,7 +617,7 @@ function connect(){
 function disconnect(){
   fetch("/api/disconnect",{method:"POST"}).then(()=>u());
 }
-function barColor(v){return v>=70?"#f85149":v>=40?"#d29922":v>=20?"#58a6ff":"#3fb950"}
+function barColor(v){return v>=70?"#3fb950":v>=40?"#d29922":v>=20?"#f85149":"#f85149"}
 function u(){fetch("/api").then(r=>r.json()).then(d=>{
   // Connection info
   const ci=document.getElementById("connInfo");
@@ -469,7 +644,7 @@ function u(){fetch("/api").then(r=>r.json()).then(d=>{
   document.getElementById("catBars").innerHTML=Object.keys(catNames).map(k=>{
     const v=cats[k]||0;
     const inv=100-v; // lower score = better for security
-    return "<div class='cat-row'><div class='cat-label'>"+catNames[k]+"</div><div class='cat-bar'><div class='cat-fill' style='width:"+inv+"%;background:"+barColor(v)+"'></div></div><div class='cat-val' style='color:"+barColor(v)+"'>"+v+"</div></div>";
+    return "<div class='cat-row'><div class='cat-label'>"+catNames[k]+"</div><div class='cat-bar'><div class='cat-fill' style='width:"+v+"%;background:"+barColor(v)+"'></div></div><div class='cat-val' style='color:"+barColor(v)+"'>"+v+"</div></div>";
   }).join("");
 
   // Info grid
@@ -494,22 +669,23 @@ function u(){fetch("/api").then(r=>r.json()).then(d=>{
     return "<span class='tag "+cls+"'>"+f.check_type+": "+f.result+"</span>";
   }).join("")||"<span style='color:#484f58;font-size:11px'>No findings yet</span>";
 
-  // Scan history mini chart
+  // Scan history mini chart (scores inverted: stored=problems, display=security)
   const sh=d.scan_history||[];
-  const maxS=Math.max(...sh.map(s=>s.score),1);
+  const maxS=Math.max(...sh.map(s=>100-s.score),1);
   document.getElementById("histChart").innerHTML=sh.map(s=>{
-    const h=Math.max(3,s.score/maxS*100);
-    return "<div class='hist-bar' style='height:"+h+"%;background:"+barColor(s.score)+"' title='Score: "+s.score+"'></div>";
+    const sec=100-s.score;
+    const h=Math.max(3,sec/maxS*100);
+    return "<div class='hist-bar' style='height:"+h+"%;background:"+barColor(sec)+"' title='Score: "+sec+"'></div>";
   }).join("")||"";
 
   // Alerts table
   document.getElementById("tal").innerHTML=d.alerts.map(a=>"<tr><td style='white-space:nowrap'>"+a.ts+"</td><td class='sev-"+a.sev+"'>"+a.sev+"</td><td>"+a.rule+"</td><td style='color:#8b949e'>"+a.msg+"</td></tr>").join("")||"<tr><td colspan=4 style='color:#484f58'>No alerts</td></tr>";
 
-  // Events table
-  document.getElementById("tev").innerHTML=d.events.map(e=>{
-    const c=e.result==="OK"?"ok":e.result==="EXPOSED"||e.result==="DOWN"?"err":"warn";
-    return "<tr><td>"+e.check_type+"</td><td class='"+c+"'>"+e.result+"</td><td>"+e.score+"</td><td style='color:#8b949e;max-width:300px;overflow:hidden;text-overflow:ellipsis'>"+e.detail+"</td></tr>";
-  }).join("")||"<tr><td colspan=4 style='color:#484f58'>No scan results yet</td></tr>";
+  // Request log
+  document.getElementById("treq").innerHTML=(d.request_log||[]).reverse().map(r=>{
+    const c=r.attack?"err":r.status>=400?"warn":"ok";
+    return "<tr><td style='white-space:nowrap'>"+r.ts+"</td><td>"+r.ip+"</td><td>"+r.method+"</td><td style='max-width:180px;overflow:hidden;text-overflow:ellipsis'>"+r.path+"</td><td class='"+c+"'>"+r.status+"</td>"+(r.attack?"<td class='err'><b>"+r.attack+"</b></td>":"<td style='color:#484f58'>-</td>")+"</tr>";
+  }).join("")||"<tr><td colspan=6 style='color:#484f58'>No log file connected. Start with: python siem.py --log access.log</td></tr>";
 });}
 setInterval(u,3000);u();
 </script></body></html>"""
@@ -519,7 +695,9 @@ def _get_category_scores(domain):
     cats = {}
     for cat in ("uptime", "ssl", "headers", "paths"):
         rows = db_query("SELECT score FROM events WHERE domain=? AND check_type=? ORDER BY id DESC LIMIT 1", (domain, cat))
-        cats[cat] = rows[0]["score"] if rows else 0
+        # Invert: stored score = problem count (0=good), display as security (100=good)
+        raw = rows[0]["score"] if rows else 0
+        cats[cat] = max(0, 100 - raw)
     return cats
 
 def _get_response_times(domain):
@@ -576,6 +754,7 @@ class DashHandler(SimpleHTTPRequestHandler):
                 "scan_history": SCAN_HISTORY[-15:],
                 "category_scores": _get_category_scores(domain),
                 "response_times": _get_response_times(domain),
+                "request_log": REQUEST_LOG[-100:],
             })
         else:
             self.send_response(200)
@@ -610,19 +789,46 @@ class DashHandler(SimpleHTTPRequestHandler):
 
 # ── Main ─────────────────────────────────────────────────────────────────
 def main():
+    global LOG_PATH
+    for i, arg in enumerate(sys.argv[1:], 1):
+        if arg == "--log" and i < len(sys.argv):
+            LOG_PATH = sys.argv[i + 1]
+
     print("=" * 50)
-    print("  SIEM MONITOR v2")
+    print("  SIEM MONITOR v3")
     print("=" * 50)
 
     init_db()
     db_load_config()
 
+    # Load recent requests from DB into display buffer (attacks first, then recent clean)
+    for r in db_query("SELECT ts, ip, method, path, status, attack FROM requests WHERE attack IS NOT NULL AND attack NOT IN ('ADMIN_SCAN','SENSITIVE_FILE') ORDER BY id DESC LIMIT 50"):
+        t = r["ts"][-8:] if r["ts"] else ""
+        REQUEST_LOG.append({"ts": t, "ip": r["ip"], "method": r["method"],
+                           "path": r["path"][:80], "status": r["status"], "attack": r["attack"]})
+    for r in db_query("SELECT ts, ip, method, path, status, attack FROM requests WHERE attack IS NULL AND path NOT IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ORDER BY id DESC LIMIT 50",
+                      tuple(_SCANNER_PROBES)):
+        t = r["ts"][-8:] if r["ts"] else ""
+        REQUEST_LOG.append({"ts": t, "ip": r["ip"], "method": r["method"],
+                           "path": r["path"][:80], "status": r["status"], "attack": r["attack"]})
+
+    # Run log rules once on startup to catch any backlog
+    try:
+        run_log_rules()
+    except Exception:
+        pass
+
     threading.Thread(target=monitor_loop, daemon=True).start()
     threading.Thread(target=run_dashboard, daemon=True).start()
+    threading.Thread(target=log_rules_loop, daemon=True).start()
+    if LOG_PATH:
+        threading.Thread(target=watch_log, daemon=True).start()
 
     print(f"  Dashboard: http://localhost:{DASHBOARD_PORT}")
     if CONFIG["domain"]:
         print(f"  Monitoring: {CONFIG['domain']}")
+    if LOG_PATH:
+        print(f"  Log file: {LOG_PATH}")
     print("=" * 50)
 
     try:
@@ -632,7 +838,7 @@ def main():
         print("\nStopped.")
 
 def run_dashboard():
-    server = HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashHandler)
+    server = ThreadedHTTPServer(("0.0.0.0", DASHBOARD_PORT), DashHandler)
     server.serve_forever()
 
 if __name__ == "__main__":
