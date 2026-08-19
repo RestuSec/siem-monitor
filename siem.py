@@ -167,7 +167,10 @@ def _groq_chat(messages):
     resp = urllib.request.urlopen(req, timeout=30)
     data = json.loads(resp.read())
     text = data["choices"][0]["message"]["content"]
-    # filter <think> artifacts
+    # filter thinking tags (semua variasi)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL).strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     # strip markdown + html formatting
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
