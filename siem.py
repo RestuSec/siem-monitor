@@ -137,11 +137,13 @@ GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 AI_SYSTEM = (
-    "Kamu adalah ahli keamanan siber (SIEM Analyst) yang bekerja untuk RestuSec. "
-    "Selalu jawab dalam Bahasa Indonesia. "
-    "Kamu memantau website restusec.my.id yang berjalan di Python FastAPI + Cloudflare Tunnel. "
-    "Jika ditanya sesuatu, jawab singkat, jelas, langsung ke intinya. "
-    "Jika ada serangan, langsung kasih rekomendasi aksi yang bisa dilakukan."
+    "Kamu adalah asisten keamanan siber yang ramah dan helpful. "
+    "Gunakan Bahasa Indonesia yang natural, kayak lagi ngobrol sama temen. "
+    "Format jawaban pakai bold, bullet point, dan baris baru yang rapi. "
+    "Kamu memantau website restusec.my.id (FastAPI + Cloudflare Tunnel). "
+    "Jawab singkat, jelas, langsung ke inti. "
+    "Kalau ada serangan, kasih rekomendasi aksi yang bisa langsung dilakuin. "
+    "Kalau ditanya 'halo' atau sapaan, balas dengan sapaan hangat dan tawarin bantuan."
 )
 AI_CHAT_HISTORY = []  # max 10 messages
 
@@ -220,13 +222,16 @@ def ai_analyze(alerts):
     except Exception as e:
         return {"error": str(e)}
 
-# ── Telegram Notification ────────────────────────────────────────────────
-def tg_send(text):
+# ── Telegram Bot (2 arah + notifikasi) ───────────────────────────────────
+def tg_send(text, chat_id=None):
     """Kirim pesan ke Telegram."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN:
+        return False
+    cid = chat_id or TELEGRAM_CHAT_ID
+    if not cid:
         return False
     try:
-        payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}).encode()
+        payload = json.dumps({"chat_id": cid, "text": text}).encode()
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data=payload,
@@ -237,11 +242,82 @@ def tg_send(text):
     except Exception:
         return False
 
+_tg_offset = 0
+def tg_bot_listener():
+    """Polling Telegram — terima pesan, respon pakai AI."""
+    global _tg_offset
+    if not TELEGRAM_TOKEN:
+        return
+    print("  Telegram bot: listening...")
+    while True:
+        time.sleep(2)
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={_tg_offset}&timeout=5"
+            req = urllib.request.Request(url)
+            resp = urllib.request.urlopen(req, timeout=15)
+            data = json.loads(resp.read())
+            for update in data.get("result", []):
+                _tg_offset = update["update_id"] + 1
+                msg = update.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = msg.get("text", "").strip()
+                if not text or not chat_id:
+                    continue
+                # handle /start
+                if text.lower() in ("/start", "/help"):
+                    tg_send(
+                        "Halo! Aku SIEM bot lo.\n\n"
+                        "Ketik apa aja buat tanya soal keamanan website.\n"
+                        "Ketik /status buat cek status server.\n"
+                        "Ketik /alerts buat lihat alert terakhir.",
+                        chat_id
+                    )
+                    continue
+                # handle /status
+                if text.lower() == "/status":
+                    domain = CONFIG.get("domain", "")
+                    threat = threat_level()
+                    level = "AMAN" if threat < 20 else "ELEVATED" if threat < 40 else "WARNING" if threat < 70 else "CRITICAL"
+                    reply = (
+                        f"Status Server:\n"
+                        f"Domain: {domain or '-'}\n"
+                        f"Threat Level: {threat} ({level})\n"
+                        f"Dashboard: http://localhost:5000"
+                    )
+                    tg_send(reply, chat_id)
+                    continue
+                # handle /alerts
+                if text.lower() == "/alerts":
+                    alerts = db_query("SELECT ts, rule, severity, message FROM alerts ORDER BY id DESC LIMIT 5")
+                    if not alerts:
+                        tg_send("Tidak ada alert.", chat_id)
+                    else:
+                        lines = [f"[{a['severity']}] {a['rule']}: {a['message']}" for a in alerts]
+                        tg_send("Alert terakhir:\n" + "\n".join(lines), chat_id)
+                    continue
+                # chat dengan AI
+                domain = CONFIG.get("domain", "")
+                recent = db_query("SELECT ts, rule, severity, message FROM alerts ORDER BY id DESC LIMIT 5")
+                ctx = f"Domain aktif: {domain or 'belum connect'}\n"
+                if recent:
+                    ctx += "Alert terakhir:\n" + "\n".join(f"- [{a['severity']}] {a['rule']}: {a['message']}" for a in recent) + "\n"
+                msgs = [
+                    {"role": "system", "content": AI_SYSTEM + "\n\n" + ctx},
+                    {"role": "user", "content": text}
+                ]
+                try:
+                    reply = _groq_chat(msgs)
+                    tg_send(reply, chat_id)
+                except Exception as e:
+                    tg_send(f"Error AI: {e}", chat_id)
+        except Exception:
+            time.sleep(5)
+
 _last_alert_id = 0
 def tg_check_new_alerts():
-    """Cek alert baru, kirim ke Telegram."""
+    """Cek alert baru CRITICAL/HIGH, kirim ke Telegram otomatis."""
     global _last_alert_id
-    alerts = db_query("SELECT id, ts, rule, severity, message FROM alerts ORDER BY id DESC LIMIT 5")
+    alerts = db_query("SELECT id, ts, rule, severity, message FROM alerts WHERE severity IN ('CRITICAL','HIGH') ORDER BY id DESC LIMIT 5")
     if not alerts:
         return
     newest_id = alerts[0]["id"]
@@ -250,13 +326,12 @@ def tg_check_new_alerts():
         return
     for a in alerts:
         if a["id"] > _last_alert_id:
-            icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "⚪"}.get(a["severity"], "⚪")
+            icon = "🔴" if a["severity"] == "CRITICAL" else "🟠"
             text = (
-                f"{icon} <b>SIEM Alert — {a['severity']}</b>\n"
+                f"{icon} <b>{a['severity']}</b>\n"
                 f"Rule: {a['rule']}\n"
                 f"Pesan: {a['message']}\n"
-                f"Waktu: {a['ts']}\n"
-                f"Domain: {CONFIG.get('domain', '-')}"
+                f"Waktu: {a['ts']}"
             )
             tg_send(text)
     _last_alert_id = newest_id
@@ -611,26 +686,27 @@ def log_rules_loop():
             pass
 
 def ai_auto_loop():
-    """Auto-analyze alerts tiap 2 menit."""
+    """Cek alert baru tiap 60 detik. Kalau ada CRITICAL/HIGH baru → kirim analisis ke Telegram."""
+    global _last_alert_id
     while True:
-        time.sleep(120)
+        time.sleep(60)
         try:
             if GROQ_KEY and CONFIG.get("domain"):
-                alerts = db_query("SELECT ts, rule, severity, message FROM alerts ORDER BY id DESC LIMIT 10")
-                if alerts:
-                    result = ai_analyze(alerts)
-                    if result.get("analysis"):
-                        # Simpan ke DB
-                        db_exec(
-                            "INSERT INTO alerts (ts, rule, severity, message, score) VALUES (?, ?, ?, ?, ?)",
-                            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "AI_ANALYSIS", "INFO",
-                             result["analysis"][:500], 0)
-                        )
+                alerts = db_query("SELECT id, ts, rule, severity, message FROM alerts WHERE severity IN ('CRITICAL','HIGH') ORDER BY id DESC LIMIT 5")
+                if not alerts:
+                    continue
+                newest = alerts[0]["id"]
+                if newest == _last_alert_id:
+                    continue  # nggak ada alert baru
+                # ada alert baru → AI analyze + kirim ke Telegram
+                result = ai_analyze(alerts)
+                if result.get("analysis"):
+                    tg_send(f"🤖 AI Analisis:\n{result['analysis']}")
         except Exception:
             pass
 
 def tg_check_loop():
-    """Cek alert baru tiap 30 detik, kirim ke Telegram."""
+    """Cek alert baru tiap 30 detik, kirim notif ke Telegram."""
     while True:
         time.sleep(30)
         try:
@@ -1067,6 +1143,7 @@ def main():
         threading.Thread(target=watch_log, daemon=True).start()
     threading.Thread(target=ai_auto_loop, daemon=True).start()
     threading.Thread(target=tg_check_loop, daemon=True).start()
+    threading.Thread(target=tg_bot_listener, daemon=True).start()
 
     print(f"  Dashboard: http://localhost:{DASHBOARD_PORT}")
     if CONFIG["domain"]:
