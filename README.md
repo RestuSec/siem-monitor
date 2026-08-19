@@ -10,9 +10,9 @@ Real-time Security Information and Event Monitoring untuk website. Zero dependen
 
 > Testing keamanan: SQL Injection, XSS, LFI, DDoS, Brute Force, Tool Scan, Method Anomaly — semua terdeteksi real-time.
 
-https://github.com/user-attachments/assets/demo.mp4
+<video src="demo.mp4" controls width="100%"></video>
 
-Atau tonton langsung: [Security Testing Demo](https://github.com/RestuSec/siem-monitor/releases/tag/v3.1)
+>[Download Video](https://github.com/RestuSec/siem-monitor/releases/tag/v3.1)
 
 ## Fitur
 
