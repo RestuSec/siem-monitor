@@ -137,13 +137,12 @@ GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 AI_SYSTEM = (
-    "Kamu adalah asisten keamanan siber yang ramah dan helpful. "
-    "Gunakan Bahasa Indonesia yang natural, kayak lagi ngobrol sama temen. "
-    "Format jawaban pakai bold, bullet point, dan baris baru yang rapi. "
-    "Kamu memantau website restusec.my.id (FastAPI + Cloudflare Tunnel). "
-    "Jawab singkat, jelas, langsung ke inti. "
-    "Kalau ada serangan, kasih rekomendasi aksi yang bisa langsung dilakuin. "
-    "Kalau ditanya 'halo' atau sapaan, balas dengan sapaan hangat dan tawarin bantuan."
+    "Kamu adalah SIEM bot yang bilingual (ID/EN). "
+    "Jawab SEKALI LANGSUNG, max 3-4 baris. "
+    "Pakai emoji secukupnya. "
+    "Kalau ditanya 'halo', cukup 'Halo! Ada yang bisa dibantu? 😊' "
+    "Kalau ada serangan, langsung: problem + aksi yang harus dilakuin. "
+    "Jangan pakai heading, jangan pakai 'Berikut analisis:', langsung aja ke inti."
 )
 AI_CHAT_HISTORY = []  # max 10 messages
 
@@ -151,7 +150,7 @@ def _groq_chat(messages):
     payload = json.dumps({
         "model": "qwen/qwen3.6-27b",
         "messages": messages,
-        "max_tokens": 600,
+        "max_tokens": 250,
         "temperature": 0.3,
     }).encode()
     req = urllib.request.Request(
@@ -199,22 +198,13 @@ def ai_analyze(alerts):
     if not alerts:
         return {"error": "Tidak ada alert untuk dianalisis."}
     alert_text = "\n".join(
-        f"- [{a['severity']}] {a['rule']}: {a['message']} (at {a['ts']})"
-        for a in alerts[:15]
+        f"- [{a['severity']}] {a['rule']}: {a['message']}"
+        for a in alerts[:10]
     )
-    events = db_query("SELECT check_type, result, detail, score FROM events WHERE domain=? ORDER BY id DESC LIMIT 10", (CONFIG.get("domain", ""),))
-    event_text = "\n".join(f"- {e['check_type']}: {e['result']} (score: {e['score']}) — {e['detail']}" for e in events[:10])
     prompt = (
-        "Kamu adalah ahli keamanan siber. Analisis alert berikut dari website restusec.my.id.\n\n"
-        f"ALERTS:\n{alert_text}\n\n"
-        f"SCAN RESULTS:\n{event_text}\n\n"
-        "Kasih:\n"
-        "1. Ringkasan pola serangan\n"
-        "2. Apakah ini serangan terarah atau random?\n"
-        "3. Rekomendasi aksi konkret\n"
-        "4. Level ancaman (1-10)\n"
-        "5. Apakah ada yang perlu di-block sekarang?\n\n"
-        "Jawab dalam Bahasa Indonesia, singkat, langsung ke inti."
+        "Analisis singkat alert ini (max 4 baris, pakai emoji):\n\n"
+        f"{alert_text}\n\n"
+        "Format: Problem → Aksi. Jangan pakai heading."
     )
     try:
         reply = _groq_chat([{"role": "user", "content": prompt}])
