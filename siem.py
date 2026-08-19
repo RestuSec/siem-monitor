@@ -866,9 +866,9 @@ def main():
         if arg == "--log" and i < len(sys.argv):
             LOG_PATH = sys.argv[i + 1]
 
-  print("=" * 50)
-  print("  SIEM MONITOR v4.0 — AI Powered")
-  print("=" * 50)
+    print("=" * 50)
+    print("  SIEM MONITOR v4.0 — AI Powered")
+    print("=" * 50)
 
     init_db()
     db_load_config()
